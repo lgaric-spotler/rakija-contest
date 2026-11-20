@@ -1,1 +1,1 @@
-{ "private": true, "description": "tests: `npm i`; LAN version: node api.js / ui.js; Firebase version: start emulators, then node rules.js / fbui.js", "dependencies": { "jsdom": "^26.0.0", "firebase": "^10.14.1" } }
+{"private":true,"description":"tests: `npm i`; LAN version: node api.js / ui.js; Firebase version: start emulators, then node rules.js / fbui.js","dependencies":{"firebase":"^10.14.1","jsdom":"^26.0.0"}}
