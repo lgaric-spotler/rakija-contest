@@ -1,0 +1,1 @@
+{ "private": true, "description": "e2e tests: `npm i` once, then `node api.js` and `node ui.js` (each starts its own server on a spare port with a temp state file)", "dependencies": { "jsdom": "^26.0.0" } }

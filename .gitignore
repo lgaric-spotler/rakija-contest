@@ -1,0 +1,10 @@
+# secrets and live/test data
+.admin_pin
+.viewer_pin
+state.json
+state.json.tmp
+test_state*.json
+serve.log
+nohup.out
+node_modules/
+__pycache__/

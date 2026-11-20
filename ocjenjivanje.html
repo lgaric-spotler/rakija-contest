@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a0f08">
+<title>Rakija Contest – točitelj</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🥃%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="/" title="Izbor uloge">🥃 Rakija Contest</a></h1>
+    <div class="sub">točitelj</div>
+  </header>
+  <nav class="tabs hidden" id="tabs">
+    <button data-tab="setup">Postavke</button>
+    <button data-tab="score">Ocjene</button>
+    <button data-tab="finale">Finale</button>
+  </nav>
+  <div id="view"></div>
+  <div class="sync" id="sync"></div>
+</main>
+
+<script src="/logic.js"></script>
+<script src="/common.js"></script>
+<script>
+// ---- state: `state` lives on the server (shared with the judge page); `ui` stays on this device ----
+const PIN_KEY = 'rakija-admin-pin', UI_KEY = 'rakija-contest-ui-v3';
+const DEFAULT_DATA = { jurors: ['Ana Horvat', 'Marko Kovač', 'Ivana Babić', 'Luka Marić'], n: 8, owners: {}, scores: {}, cats: {}, claims: {}, locked: false, open: -1, finale: null };
+const DEFAULT_UI = { tab: 'setup', round: 0 };
+const clone = o => JSON.parse(JSON.stringify(o));
+let state = clone(DEFAULT_DATA);
+let ui = (() => { try { return Object.assign(clone(DEFAULT_UI), JSON.parse(localStorage.getItem(UI_KEY))); } catch (e) { return clone(DEFAULT_UI); } })();
+let loaded = false, needPin = false, syncOk = null, saveTimer = null, loginError = '';
+
+// ---- server ----
+async function adm(path, opts) {
+  try {
+    const r = await fetch(path, Object.assign({}, opts, { headers: Object.assign({ 'Content-Type': 'application/json', 'x-admin-pin': localStorage.getItem(PIN_KEY) || '' }, opts && opts.headers) }));
+    if (r.status === 401) { needPin = true; return null; }
+    return r;
+  } catch (e) { return null; }
+}
+function adminFields() { const { jurors, n, owners, scores, locked, open, finale } = state; return { jurors, n, owners, scores, locked, open, finale }; }
+function pushState() {
+  if (!loaded) return;
+  adm('api/state', { method: 'PUT', body: JSON.stringify(adminFields()) }).then(r => { syncOk = !!(r && r.ok); paintSync(); if (needPin) render(); });
+}
+function commit() { clearTimeout(saveTimer); saveTimer = setTimeout(pushState, 120); render(); }   // data changed
+async function pull() {
+  const r = await adm('api/state');
+  if (!r || !r.ok) { syncOk = false; return render(); }
+  const s = await r.json();
+  needPin = false; loaded = true; syncOk = true;
+  if (s) state = Object.assign(clone(DEFAULT_DATA), s); else pushState();   // empty server -> seed with defaults
+  render();
+}
+async function poll() {                       // pick up judge activity (cats, claims) without touching host edits
+  if (!loaded || needPin) return;
+  const r = await adm('api/state'); if (!r || !r.ok) return;
+  const s = await r.json(); if (!s) return;
+  const before = JSON.stringify([state.cats, state.claims, state.viewerPin]);
+  state.cats = s.cats || {}; state.claims = s.claims || {}; state.viewerPin = s.viewerPin;
+  const a = document.activeElement;
+  if (before !== JSON.stringify([state.cats, state.claims, state.viewerPin]) && !(a && /INPUT|TEXTAREA/.test(a.tagName))) render();
+}
+function paintSync() {
+  const e = document.getElementById('sync'); if (!e) return;
+  e.replaceChildren(syncOk === null ? '' : syncOk ? el('b', {}, '● spremljeno na server') : el('b', { class: 'off' }, '○ server nedostupan'));
+}
+
+// ---- views ----
+function render() {
+  localStorage.setItem(UI_KEY, JSON.stringify(ui));
+  const tabs = document.getElementById('tabs');
+  tabs.classList.toggle('hidden', !loaded || needPin);
+  tabs.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.tab === ui.tab));
+  const v = document.getElementById('view');
+  v.replaceChildren(needPin ? viewLogin() : !loaded ? el('p', { class: 'mute center' }, 'Učitavanje…') :
+    ui.tab === 'setup' ? viewSetup() : ui.tab === 'score' ? viewScore() : viewFinale());
+  paintSync();
+}
+
+function viewLogin() {
+  const pin = el('input', { type: 'password', inputmode: 'numeric', placeholder: 'PIN s servera', autocomplete: 'off' });
+  const go = () => { localStorage.setItem(PIN_KEY, pin.value.trim()); loginError = ''; pull().then(() => { if (needPin) { loginError = 'Pogrešan PIN.'; render(); } }); };
+  pin.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+  return el('div', { class: 'card' }, el('h2', {}, '🔒 Prijava točitelja'),
+    el('p', { class: 'mute' }, 'PIN je ispisan u terminalu gdje radi `node serve.js`.'), pin,
+    loginError ? el('div', { class: 'warn' }, loginError) : '',
+    el('div', { style: 'margin-top:12px' }, el('button', { class: 'primary big', onclick: go }, 'Prijava')));
+}
+
+function parseNames(text) { return text.split('\n').map(s => s.trim()).filter(Boolean); }
+
+function viewSetup() {
+  const L = state.locked;
+  const names = el('textarea', { rows: 5, disabled: L, placeholder: 'Ime Prezime' });
+  names.value = state.jurors.join('\n');
+  const n = el('input', { type: 'number', min: 1, max: 20, inputmode: 'numeric', value: state.n, disabled: L });
+  const owners = el('div');
+  for (let r = 1; r <= state.n; r++) {
+    const inp = el('input', { placeholder: 'Čija je rakija ' + r + '?', value: state.owners[r] || '', disabled: L });
+    inp.addEventListener('input', () => { state.owners[r] = inp.value; clearTimeout(saveTimer); saveTimer = setTimeout(pushState, 300); });
+    owners.append(el('label', {}, 'Rakija ' + r), inp);
+  }
+  // applies the textarea + count to state; returns false if the user cancelled/invalid
+  function applySetup() {
+    const list = parseNames(names.value);
+    if (!list.length) { alert('Treba barem jedan član žirija.'); return false; }
+    if (new Set(list.map(s => s.toLowerCase())).size !== list.length) { alert('Imena žirija moraju biti različita.'); return false; }
+    const cnt = Math.max(1, Math.min(20, parseInt(n.value, 10) || 8));
+    const changed = JSON.stringify(list) !== JSON.stringify(state.jurors);
+    const hasData = Object.keys(state.scores).length || Object.keys(state.cats).length;
+    if (changed && hasData && !confirm('Promjena imena žirija briše unesene ocjene i prijave. Nastaviti?')) return false;
+    if (changed) { state.scores = {}; state.cats = {}; state.claims = {}; }
+    state.jurors = list; state.n = cnt; state.open = Math.min(state.open, cnt); state.finale = null;
+    return true;
+  }
+  const jurorsCard = el('div', { class: 'card' },
+    el('h2', {}, '👥 Žiri', L ? el('span', { class: 'pill ok' }, '🔒 zaključano') : ''),
+    el('label', {}, 'Ime i prezime, jedno po retku'), names,
+    el('label', {}, 'Broj rakija (bez kalibracije)'), n,
+    L ? el('div', { style: 'margin-top:14px' }, el('button', { class: 'big', onclick: () => {
+        if (!confirm('Otključati postavke? Sudci neće moći nastaviti dok ih ponovno ne zaključaš.')) return;
+        state.locked = false; commit();
+      } }, '🔓 Otključaj postavke'))
+      : el('div', { class: 'row full', style: 'margin-top:14px' },
+          el('button', { onclick: () => { if (applySetup()) commit(); } }, 'Spremi'),
+          el('button', { class: 'primary', onclick: () => {
+            if (!applySetup()) return;
+            const missing = []; for (let r = 1; r <= state.n; r++) if (!(state.owners[r] || '').trim()) missing.push(r);
+            if (missing.length) { alert('Ključ nije potpun. Upiši vlasnika za rakije: ' + missing.join(', ')); return commit(); }
+            if (!confirm('Zaključati postavke? Sudci će se moći prijaviti na svoja imena.')) return commit();
+            state.locked = true; commit();
+          } }, 'Zaključi postavke')));
+  const keyCard = el('div', { class: 'card' },
+    el('h2', {}, '🔑 Ključ'),
+    el('p', { class: 'mute' }, 'Samo za točitelja: čija je koja rakija (prikazuje se u finalu). Svi ocjenjuju sve rakije, uključujući vlastitu.'),
+    owners);
+  const claimsCard = !L ? '' : el('div', { class: 'card' },
+    el('h2', {}, '📱 Prijavljeni sudci'),
+    el('p', { class: 'mute' }, 'Sudac na svom mobitelu otvara stranicu za sudce i bira svoje ime.'),
+    state.jurors.map((j, i) => el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j),
+      state.claims[i] ? el('span', { class: 'row' }, el('span', { class: 'pill ok' }, 'prijavljen'),
+        el('button', { class: 'small', onclick: async () => { if (!confirm('Osloboditi ' + j + '?')) return; await adm('api/admin/release', { method: 'POST', body: JSON.stringify({ juror: i }) }); delete state.claims[i]; render(); } }, 'Oslobodi'))
+        : el('span', { class: 'pill' }, 'slobodan')))));
+  const pinCard = !state.viewerPin ? '' : el('div', { class: 'card' },
+    el('h2', {}, '👀 PIN za gledatelje'),
+    el('div', { class: 'bigname', style: 'margin:6px 0;font-size:44px;letter-spacing:6px;text-align:center' }, state.viewerPin),
+    el('p', { class: 'mute' }, 'Daj ga samo gledateljima (stranica /gledatelj). Sudci ga ne smiju imati.'));
+  return el('div', {}, jurorsCard, keyCard, claimsCard, pinCard,
+    el('div', { class: 'card' }, el('button', { class: 'danger', onclick: async () => {
+      if (!confirm('Obrisati sve ocjene, prijave i postavke?')) return;
+      await adm('api/admin/reset', { method: 'POST' }); state = clone(DEFAULT_DATA); ui = clone(DEFAULT_UI); pushState(); render(); setTimeout(poll, 400);
+    } }, 'Reset svega')));
+}
+
+function judgeStatus(r, i) {
+  const cell = ((state.cats[r] || {})[i]);
+  if (cell && cell.locked) return ['✓ zaključio', 'ok'];
+  if (cell && cell.c.some(v => v !== null)) return ['… ocjenjuje', ''];
+  return [state.claims[i] ? 'čeka' : 'nije prijavljen', ''];
+}
+
+function viewScore() {
+  const r = Math.min(ui.round, state.n);
+  const miss = missingScores(state);
+  const open = state.open;
+
+  const roundCard = el('div', { class: 'card' },
+    el('h2', {}, '🎬 Runda za sudce'),
+    !state.locked ? el('div', { class: 'warn' }, 'Prvo zaključi postavke (tab Postavke).') : '',
+    el('p', {}, open < 0 ? 'Još nije otvorena nijedna rakija.' : ['Sudci sada ocjenjuju: ', el('b', {}, roundLabel(open))]),
+    open >= 0 ? state.jurors.map((j, i) => { const [t, c] = judgeStatus(open, i);
+      return el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j), el('span', { class: 'pill ' + c }, t))); }) : '',
+    el('div', { class: 'row full', style: 'margin-top:14px' },
+      open >= 0 ? el('button', { class: 'small', onclick: () => {
+        const anyLocked = state.jurors.some((_, i) => (state.cats[open] || {})[i] && state.cats[open][i].locked);
+        if (anyLocked && !confirm('Neki sudci su već zaključili ovu rakiju. Svejedno vratiti?')) return;
+        state.open = open - 1; commit(); } }, '◀ Vrati') : '',
+      el('button', { class: 'primary', disabled: !state.locked || open >= state.n, onclick: () => { state.open = open + 1; ui.round = state.open; commit(); } },
+        open >= state.n ? 'Sve rakije otvorene' : 'Otvori ' + roundLabel(open + 1) + ' ▶')));
+
+  const chips = el('div', { class: 'chips' });
+  for (let i = 0; i <= state.n; i++) {
+    const done = !miss.some(m => m.round === i);
+    chips.append(el('button', { class: (done ? 'done ' : '') + (i === r ? 'cur' : ''), onclick: () => { ui.round = i; render(); } }, i === 0 ? 'K' : String(i)));
+  }
+  const entered = state.jurors.filter((_, i) => scoreOf(state, r, i) !== null).length;
+  const jur = state.jurors.map((j, i) => {
+    const cell = (state.cats[r] || {})[i];
+    const cur = (state.scores[r] || {})[i];
+    if (cell && cell.locked) {
+      return el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j),
+        el('span', { class: 'row' }, el('small', {}, '📱 ' + catAverage(cell.c).toFixed(2)),
+          el('button', { class: 'small', onclick: async () => {
+            if (!confirm('Otključati ocjenu za ' + j + '? Sudac je može ponovno urediti.')) return;
+            await adm('api/admin/reopen', { method: 'POST', body: JSON.stringify({ round: r, juror: i }) });
+            cell.locked = false; render(); } }, 'Otključaj'))));
+    }
+    const grid = el('div', { class: 'grid' });
+    for (let s = SCORE_MIN; s <= SCORE_MAX; s++) {
+      grid.append(el('button', { class: cur === s ? 'sel' : '', onclick: () => {
+        state.scores[r] = state.scores[r] || {};
+        if (state.scores[r][i] === s) delete state.scores[r][i]; else state.scores[r][i] = s;
+        commit();
+      } }, String(s)));
+    }
+    return el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j), cur ? el('small', {}, String(cur)) : ''), grid);
+  });
+  return el('div', {}, roundCard,
+    el('div', { class: 'card' }, el('h2', {}, '✍️ Ručni unos / pregled'), chips),
+    el('div', { class: 'card' },
+      el('h2', {}, roundLabel(r), r === 0 ? el('span', { class: 'pill' }, 'ne ulazi u bodove') : ''),
+      el('div', { class: 'bar' }, el('i', { style: 'width:' + (100 * entered / state.jurors.length) + '%' })),
+      el('div', { class: 'mute' }, 'Ocjena ima ' + entered + ' / ' + state.jurors.length + ' · mobitel zaključuje ocjenu sam, ručni unos je rezerva · poredak je skriven do finala'),
+      jur,
+      el('div', { class: 'row full', style: 'margin-top:18px' },
+        r > 0 ? el('button', { onclick: () => { ui.round = r - 1; render(); } }, '◀ Prethodna') : '',
+        r < state.n ? el('button', { class: 'primary', onclick: () => { ui.round = r + 1; render(); } }, 'Sljedeća ▶')
+                    : el('button', { class: 'primary', onclick: () => { ui.tab = 'finale'; render(); } }, 'Finale 🏆'))));
+}
+
+function viewFinale() {
+  const miss = missingScores(state);
+  if (!state.finale) {
+    return el('div', { class: 'card center' },
+      el('h2', { style: 'justify-content:center' }, '🏆 Finale'),
+      el('p', { class: 'mute' }, 'Ocjene i poredak ostaju skriveni dok ne pokreneš finale. Kad ga pokreneš, i sudci i gledatelji vide otkrivanje na svojim ekranima.'),
+      miss.length ? el('div', { class: 'warn' }, 'Nedostaje ' + miss.length + ' ocjena: ' +
+        miss.slice(0, 8).map(m => roundLabel(m.round) + ' / ' + m.juror).join(', ') + (miss.length > 8 ? ' …' : '')) : '',
+      el('button', { class: 'primary big', onclick: () => {
+        if (miss.length && !confirm('Nedostaju ocjene. Svejedno pokrenuti finale?')) return;
+        state.finale = { step: 0 }; commit();
+      } }, 'Pokreni finale'));
+  }
+  const f = finaleView(state);             // exactly what judges and viewers see
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('div', { class: 'row full' },
+        f.done ? el('span', { class: 'center', style: 'font-weight:700' }, 'Gotovo 🎉')
+               : el('button', { class: 'primary', style: 'font-size:18px;padding:16px', onclick: () => { state.finale = { step: f.step + 1 }; commit(); } },
+                   f.step % 2 === 0 ? 'Otkrij rezultat ▶' : 'Otkrij vlasnika ▶')),
+      el('div', { class: 'row full', style: 'margin-top:8px' },
+        el('button', { onclick: () => { state.finale = { step: f.total }; commit(); } }, 'Prikaži sve'),
+        el('button', { onclick: () => { if (!confirm('Zatvoriti finale? Sudci i gledatelji se vraćaju na normalni prikaz.')) return; state.finale = null; commit(); } }, 'Natrag')),
+      f.done && f.tied ? el('div', { class: 'warn' }, 'Izjednačeno za 1. mjesto → blind dvoboj.') : ''),
+    f.items.length ? '' : el('p', { class: 'mute center' }, 'Počinje od zadnjeg mjesta…'),
+    rankCards(f));
+}
+
+document.getElementById('tabs').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  ui.tab = b.dataset.tab; render();
+});
+render();
+pull();
+setInterval(poll, 3000);
+</script>
+</body>
+</html>

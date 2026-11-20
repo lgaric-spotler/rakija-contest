@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a0f08">
+<title>Rakija Contest – sudac</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🥃%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="/" title="Izbor uloge">🥃 Rakija Contest</a></h1>
+    <div class="sub">sudac</div>
+  </header>
+  <div id="view"></div>
+</main>
+
+<script src="/logic.js"></script>
+<script src="/common.js"></script>
+<script>
+const TOKEN_KEY = 'rakija-judge-token', WELCOME_KEY = 'rakija-judge-welcomed';
+let info = null, finale = null, interim = null, err = '', busy = false;
+let saveQueue = Promise.resolve();
+
+// random device token (crypto.randomUUID is unavailable on plain http, getRandomValues is not)
+function token() {
+  let t = localStorage.getItem(TOKEN_KEY);
+  if (!t) { const a = new Uint8Array(16); crypto.getRandomValues(a); t = [...a].map(b => b.toString(16).padStart(2, '0')).join(''); localStorage.setItem(TOKEN_KEY, t); }
+  return t;
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/j/info', { headers: { 'x-token': token() } });
+    const next = await r.json();
+    if (JSON.stringify(next) !== JSON.stringify(info)) { info = next; render(); }
+  } catch (e) { /* offline: keep what we have */ }
+}
+
+// POST a judge action. Returns the new info on success, or null (and sets `err`).
+async function post(action, body) {
+  try {
+    const r = await fetch('/api/j/' + action, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ token: token() }, body)) });
+    if (!r.ok) { err = await r.text(); refresh(); return null; }
+    err = ''; return await r.json();
+  } catch (e) { err = 'Nema veze sa serverom.'; return null; }
+}
+
+const welcomed = () => info && info.me !== null && localStorage.getItem(WELCOME_KEY) === String(info.me);
+const currentRound = () => firstOpenRound(info.mine, info.n);
+const bigName = () => info.name.toLocaleUpperCase('hr');
+
+function render() {
+  const v = document.getElementById('view');
+  const body = finale ? revealView(finale)          // host started the finale: everyone follows the reveal
+    : !info ? el('p', { class: 'mute center' }, 'Učitavanje…')
+    : !info.locked ? viewWaitSetup()
+    : info.me === null ? viewPick()
+    : !welcomed() ? viewWelcome()
+    : interim !== null ? viewInterim()
+    : currentRound() === null ? viewStats()
+    : currentRound() > info.open ? viewWait(currentRound())
+    : viewForm(currentRound());
+  v.replaceChildren(err ? el('div', { class: 'warn' }, err) : '', body);
+}
+
+function viewWaitSetup() {
+  return el('div', { class: 'card center' }, el('div', { class: 'spin' }, '🥃'),
+    el('h2', { style: 'justify-content:center' }, 'Još malo…'),
+    el('p', { class: 'mute' }, 'Točitelj još priprema natjecanje. Stranica će se sama otvoriti kad bude spremno.'));
+}
+
+function viewPick() {
+  return el('div', { class: 'card' },
+    el('h2', {}, '👤 Tko si ti?'),
+    el('p', { class: 'mute' }, 'Odaberi svoje ime s popisa.'),
+    el('div', { class: 'list' }, info.jurors.map((j, i) => el('button', { disabled: j.taken, onclick: async () => {
+      const next = await post('claim', { juror: i });
+      if (next) { info = next; localStorage.removeItem(WELCOME_KEY); }
+      render();
+    } }, j.name, el('small', {}, j.taken ? 'zauzeto' : '')))));
+}
+
+function viewWelcome() {
+  return el('div', { class: 'card center' },
+    el('div', { class: 'bigname' }, bigName()),
+    el('button', { class: 'primary big', onclick: () => { localStorage.setItem(WELCOME_KEY, String(info.me)); render(); } }, 'DALJE ▶'),
+    el('div', { style: 'margin-top:14px' }, el('button', { class: 'small', onclick: async () => {
+      if (!confirm('Nisi ' + info.name + '?')) return;
+      const next = await post('release', {}); if (next) info = next; localStorage.removeItem(WELCOME_KEY); render();
+    } }, '← Nisam ja')));
+}
+
+function viewWait(r) {
+  return el('div', { class: 'card center' }, el('div', { class: 'spin' }, '🥃'),
+    el('h2', { style: 'justify-content:center' }, 'Čekaj točitelja…'),
+    el('p', { class: 'mute' }, r === 0 ? 'Kalibracija počinje uskoro.' : 'Sljedeće: ' + roundLabel(r) + '. Stranica će se sama otvoriti.'));
+}
+
+function viewForm(r) {
+  const cell = info.mine[r] || { c: [null, null, null, null], locked: false };
+  const avg = catAverage(cell.c);
+  const missing = CATEGORIES.filter((_, k) => cell.c[k] === null);
+  const cats = CATEGORIES.map((name, k) => {
+    const grid = el('div', { class: 'grid' });
+    for (let s = SCORE_MIN; s <= SCORE_MAX; s++) {
+      grid.append(el('button', { class: cell.c[k] === s ? 'sel' : '', onclick: () => setCat(r, k, s) }, String(s)));
+    }
+    return el('div', { class: 'card cat' }, el('div', { class: 'juror', style: 'margin:0' },
+      el('div', { class: 'name cat-name' }, el('span', {}, name), cell.c[k] ? el('small', {}, String(cell.c[k])) : ''), grid));
+  });
+  return el('div', {},
+    el('div', { class: 'card stickyavg' },
+      el('div', { class: 'lab' }, roundLabel(r) + (r === 0 ? ' · ne ulazi u bodove' : '') + ' · prosjek'),
+      el('div', { class: 'val' }, avg === null ? '-' : avg.toFixed(2))),
+    cats,
+    el('button', { class: 'primary big', disabled: busy || missing.length > 0, onclick: () => lock(r) }, 'Zaključi ocjenu'),
+    el('p', { class: 'mute center' }, missing.length ? 'Ocijeni još: ' + missing.join(', ') : 'Dodir na istu ocjenu je briše.'));
+}
+
+function setCat(r, k, s) {
+  const cell = info.mine[r] || { c: [null, null, null, null], locked: false };
+  const c = cell.c.slice(); c[k] = c[k] === s ? null : s;
+  info.mine[r] = { c, locked: false };
+  render();
+  // drafts are saved in order; the response is ignored so it cannot overwrite newer taps
+  saveQueue = saveQueue.then(() => fetch('/api/j/score', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: token(), round: r, c, lock: false }) })
+    .then(async x => { if (!x.ok) { err = await x.text(); refresh(); render(); } }).catch(() => {}));
+}
+
+async function lock(r) {
+  const c = (info.mine[r] || { c: [null, null, null, null] }).c;
+  if (c.some(v => v === null)) return;   // button is disabled; server enforces it too
+  busy = true; await saveQueue;
+  const next = await post('score', { round: r, c, lock: true });
+  busy = false;
+  if (next) { info = next; interim = r; }
+  render();
+}
+
+function viewInterim() {
+  const cell = info.mine[interim];
+  return el('div', { class: 'card center' },
+    el('h2', { style: 'justify-content:center' }, '✓ Ocjena zaključena'),
+    el('div', { class: 'mute' }, roundLabel(interim)),
+    el('div', { class: 'bigname', style: 'margin:14px 0 24px' }, catAverage(cell.c).toFixed(2)),
+    el('button', { class: 'primary big', onclick: () => { interim = null; render(); } }, 'DALJE ▶'));
+}
+
+function viewStats() {
+  const st = judgeStats(info.mine, info.n);
+  const names = list => list.map(x => 'Rakija ' + x.round).join(', ') || '–';
+  const bestCat = st.catMeans.reduce((b, v, k) => (v !== null && (b === -1 || v > st.catMeans[b])) ? k : b, -1);
+  return el('div', {},
+    el('div', { class: 'card center' }, el('h2', { style: 'justify-content:center' }, '📊 Tvoja statistika'), el('div', { class: 'mute' }, info.name)),
+    el('div', { class: 'card' }, el('div', { class: 'sum' },
+      el('div', {}, el('span', { class: 'mute' }, 'Tvoj prosjek'), el('b', {}, st.mean === null ? '-' : st.mean.toFixed(2))),
+      el('div', {}, el('span', { class: 'mute' }, 'Najjača kategorija'), el('b', {}, bestCat === -1 ? '-' : CATEGORIES[bestCat])),
+      el('div', {}, el('span', { class: 'mute' }, 'Tvoja favoritkinja'), el('b', { style: 'font-size:18px' }, names(st.best))),
+      el('div', {}, el('span', { class: 'mute' }, 'Najslabije ocijenjena'), el('b', { style: 'font-size:18px' }, names(st.worst))))),
+    el('div', { class: 'card' }, el('h2', {}, 'Tvoj poredak'),
+      st.ranked.map(x => el('div', {},
+        el('div', { class: 'stat' },
+          el('div', { class: 'lbl' }, (x.place === null ? '–' : x.place + '.') + ' Rakija ' + x.round),
+          el('div', { class: 'meter' }, el('i', { style: 'width:' + (x.avg === null ? 0 : x.avg * 10) + '%' })),
+          el('div', { class: 'num' }, x.avg === null ? '-' : x.avg.toFixed(1))),
+        el('div', { class: 'mute', style: 'margin:-4px 0 6px 106px;font-size:12px' },
+          CATEGORIES.map((n, k) => n[0] + ' ' + (x.c[k] === null ? '–' : x.c[k])).join(' · '))))),
+    el('p', { class: 'mute center' }, 'Hvala na ocjenjivanju! Ukupne rezultate objavljuje točitelj. 🥃'));
+}
+
+// the finale reveal follows the host live, on every screen
+async function pollFinale() {
+  try {
+    const next = await (await fetch('/api/finale')).json();
+    if (JSON.stringify(next) !== JSON.stringify(finale)) { finale = next; render(); }
+  } catch (e) {}
+}
+setInterval(pollFinale, 1000);
+
+// poll only on screens that wait for the host
+setInterval(() => {
+  const waiting = !info || !info.locked || info.me === null ||
+    (welcomed() && interim === null && currentRound() !== null && currentRound() > info.open);
+  if (waiting) refresh();
+}, 2500);
+render();
+refresh();
+pollFinale();
+</script>
+</body>
+</html>
