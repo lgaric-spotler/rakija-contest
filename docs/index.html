@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a0f08">
+<title>Rakija Contest</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🥃%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="index.html">🥃 Rakija Contest</a></h1>
+    <div class="sub">prijava</div>
+  </header>
+  <div id="view"></div>
+</main>
+
+<script src="vendor/firebase-app-compat.js"></script>
+<script src="vendor/firebase-auth-compat.js"></script>
+<script src="vendor/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="logic.js"></script>
+<script src="common.js"></script>
+<script src="fb.js"></script>
+<script>
+// one box: name (+ PIN when the name already exists). New name -> account is created and the PIN is shown once.
+let mode = 'name', typedName = '', error = '', busy = false, fresh = null;   // mode: name | secret | pin
+const view = document.getElementById('view');
+const MSG = {
+  'bad-name': 'Upiši ime (slova ili brojke, najviše 40 znakova).',
+  'bad-secret': 'Pogrešan PIN.', 'no-user': 'Ovo ime nije registrirano.', 'too-many': 'Previše pokušaja. Pričekaj minutu.',
+  'auth/network-request-failed': 'Nema veze s internetom.',
+};
+
+function render() {
+  if (!FB.configured) return view.replaceChildren(el('div', { class: 'card' }, el('h2', {}, '⚙️ Firebase nije podešen'),
+    el('p', { class: 'mute' }, 'Upiši Firebase postavke u datoteku docs/firebase-config.js (vidi README).')));
+  if (fresh) return view.replaceChildren(pinCard());
+  view.replaceChildren(mode === 'name' ? nameCard() : secretCard());
+}
+
+function nameCard() {
+  const name = el('input', { placeholder: 'Ime i prezime', autocomplete: 'name', maxlength: 40, value: typedName });
+  const go = () => submitName(name.value);
+  name.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+  setTimeout(() => name.focus(), 0);
+  return el('div', { class: 'card' }, el('h2', {}, '👋 Tko si ti?'),
+    el('p', { class: 'mute' }, 'Upiši svoje ime i prezime. Ako si već ovdje bio/la, upiši isto ime pa PIN.'), name,
+    error ? el('div', { class: 'warn' }, error) : '',
+    el('div', { style: 'margin-top:12px' }, el('button', { class: 'primary big', disabled: busy, onclick: go }, 'DALJE ▶')));
+}
+
+function secretCard() {
+  const admin = FB.isAdminName(typedName);
+  const pin = el('input', { type: 'password', inputmode: admin ? 'text' : 'numeric', placeholder: admin ? 'Lozinka' : 'PIN (6 znamenki)', autocomplete: 'current-password' });
+  const go = () => submitSecret(pin.value);
+  pin.addEventListener('keydown', e => { if (e.key === 'Enter') go(); });
+  setTimeout(() => pin.focus(), 0);
+  return el('div', { class: 'card' }, el('h2', {}, '🔑 ' + typedName),
+    el('p', { class: 'mute' }, admin ? 'Prijava točitelja.' : 'To ime već postoji. Upiši svoj PIN (dobio/la si ga kad si se prvi put prijavio/la; točitelj ga također može vidjeti).'), pin,
+    error ? el('div', { class: 'warn' }, error) : '',
+    el('div', { class: 'row full', style: 'margin-top:12px' },
+      el('button', { onclick: () => { mode = 'name'; error = ''; render(); } }, '← Drugo ime'),
+      el('button', { class: 'primary', disabled: busy, onclick: go }, 'Prijava')));
+}
+
+function pinCard() {
+  return el('div', { class: 'card center' }, el('h2', { style: 'justify-content:center' }, '✅ Dobrodošao/la, ' + fresh.name),
+    el('p', { class: 'mute' }, 'Ovo je tvoj PIN. Zapamti ga ili slikaj ekran. Trebat će ti ako se prijaviš s drugog mobitela.'),
+    el('div', { class: 'pinbox' }, fresh.pin),
+    el('p', { class: 'mute' }, 'Možeš ga kasnije vidjeti dodirom na „PIN” ispod naslova.'),
+    el('button', { class: 'primary big', onclick: route }, 'DALJE ▶'));
+}
+
+async function submitName(raw) {
+  error = ''; typedName = FB.cleanName(raw); busy = true; render();
+  try {
+    if (!typedName || !FB.slug(typedName)) throw { code: 'bad-name' };
+    if (FB.isAdminName(typedName)) { mode = 'secret'; return; }
+    fresh = await FB.register(typedName);                 // new name -> account + PIN
+  } catch (e) {
+    if (e.code === 'taken') mode = 'secret';
+    else error = MSG[e.code] || 'Greška: ' + (e.message || e.code);
+  } finally { busy = false; render(); }
+}
+
+async function submitSecret(secret) {
+  error = ''; busy = true; render();
+  try { await FB.login(typedName, secret); await route(); return; }
+  catch (e) { error = MSG[e.code] || 'Greška: ' + (e.message || e.code); }
+  busy = false; render();
+}
+
+async function route() { FB.go(FB.PAGE[await FB.roleOf(FB.user)]); }
+
+(async () => {
+  render();
+  if (!FB.configured) return;
+  const u = await FB.ready;
+  if (u) route();      // already signed in on this device
+})();
+</script>
+</body>
+</html>

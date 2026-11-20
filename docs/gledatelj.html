@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a0f08">
+<title>Rakija Contest – gledatelj</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🥃%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<style>
+  table.rt { width:100%; border-collapse:collapse; margin-top:6px; }
+  .rt th { color:var(--mute); font-size:12px; font-weight:600; text-align:center; padding:4px 2px; }
+  .rt th:first-child, .rt td:first-child { text-align:left; }
+  .rt td { padding:8px 2px; text-align:center; border-top:1px solid var(--line); font-weight:700; }
+  .rt td:first-child { font-weight:600; font-size:14px; padding-right:6px; }
+  .rt td.avg { color:var(--gold2); }
+  .rt td.none { color:var(--mute); font-weight:400; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="index.html" title="Početna">🥃 Rakija Contest</a></h1>
+    <div class="sub">gledatelj</div>
+    <div class="who" id="who"></div>
+  </header>
+  <div id="view"></div>
+</main>
+
+<script src="vendor/firebase-app-compat.js"></script>
+<script src="vendor/firebase-auth-compat.js"></script>
+<script src="vendor/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="logic.js"></script>
+<script src="common.js"></script>
+<script src="fb.js"></script>
+<script>
+let st = null, pubRounds = {}, finale = null;
+
+// what the host published: for every opened rakija the locked ratings of ALL judges, but only once everybody has rated it
+function info() {
+  const rounds = [];
+  for (let r = 0; r <= Math.min(st.open, st.n); r++) {
+    const e = pubRounds[r] || {};
+    const ratings = e.ratings ? (Array.isArray(e.ratings) ? e.ratings : Object.values(e.ratings)).map(x => ({
+      name: x.name, avg: x.avg, c: x.c ? String(x.c).split(',').map(Number) : null })) : null;
+    rounds.push({ round: r, done: e.done || 0, total: e.total || 0, ratings });
+  }
+  return { locked: st.locked, n: st.n, open: st.open, rounds };
+}
+
+function render() {
+  const v = document.getElementById('view');
+  v.replaceChildren(finale ? revealView(finale)               // same view and timing as the judges
+    : !st ? el('p', { class: 'mute center' }, 'Učitavanje…')
+    : !st.locked || st.open < 0 ? waiting()
+    : stats(info()));
+}
+
+function waiting() {
+  return el('div', { class: 'card center' }, el('div', { class: 'spin' }, '🥃'),
+    el('h2', { style: 'justify-content:center' }, 'Uskoro počinje'),
+    el('p', { class: 'mute' }, 'Ovdje ćeš pratiti zaključane ocjene svih sudaca. Stranica se osvježava sama.'));
+}
+
+function stats(info) {
+  const cur = info.rounds[info.rounds.length - 1];
+  const cards = info.rounds.slice().reverse().map(r => r.ratings ? roundCard(r) : pendingCard(r));
+  return el('div', {},
+    el('div', { class: 'card center' },
+      el('div', { class: 'mute' }, 'Trenutno'),
+      el('div', { style: 'font-size:24px;font-weight:800' }, roundLabel(cur.round)),
+      el('div', { class: 'bar' }, el('i', { style: 'width:' + (cur.total ? 100 * cur.done / cur.total : 0) + '%' })),
+      el('div', { class: 'mute' }, cur.done + ' / ' + cur.total + ' sudaca je zaključilo ocjenu')),
+    cards,
+    el('p', { class: 'mute center' }, 'Ocjene rakije se pojavljuju kad je zaključe svi sudci. Ukupni poredak i vlasnici otkrivaju se u finalu.'));
+}
+
+function pendingCard(r) {
+  return el('div', { class: 'card' }, el('h2', {}, roundLabel(r.round), r.round === 0 ? el('span', { class: 'pill' }, 'ne ulazi u bodove') : ''),
+    el('p', { class: 'mute' }, 'Ocjenjivanje u tijeku… ' + r.done + ' / ' + r.total));
+}
+
+function roundCard(r) {
+  const head = el('tr', {}, el('th', {}, 'Sudac'), CATEGORIES.map(c => el('th', {}, c)), el('th', {}, 'Ø'));
+  const rows = r.ratings.map(x => el('tr', {},
+    el('td', {}, x.name),
+    CATEGORIES.map((_, k) => x.c ? el('td', {}, String(x.c[k])) : el('td', { class: 'none' }, '–')),
+    el('td', { class: 'avg' }, x.avg.toFixed(2))));
+  return el('div', { class: 'card' },
+    el('h2', {}, roundLabel(r.round), r.round === 0 ? el('span', { class: 'pill' }, 'ne ulazi u bodove') : ''),
+    el('table', { class: 'rt' }, el('thead', {}, head), el('tbody', {}, rows)));
+}
+
+FB.guard('viewer').then(() => {
+  FB.db.ref('state').on('value', s => { st = FB.stateOf(s.val()); render(); });
+  FB.db.ref('pub/rounds').on('value', s => { pubRounds = s.val() || {}; render(); }, () => {});
+  FB.db.ref('pub/finale').on('value', s => { finale = FB.finaleOf(s.val()); render(); });
+});
+render();
+</script>
+</body>
+</html>

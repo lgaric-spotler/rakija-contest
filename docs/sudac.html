@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a0f08">
+<title>Rakija Contest – sudac</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🥃%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="index.html" title="Početna">🥃 Rakija Contest</a></h1>
+    <div class="sub">sudac</div>
+    <div class="who" id="who"></div>
+  </header>
+  <div id="view"></div>
+</main>
+
+<script src="vendor/firebase-app-compat.js"></script>
+<script src="vendor/firebase-auth-compat.js"></script>
+<script src="vendor/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="logic.js"></script>
+<script src="common.js"></script>
+<script src="fb.js"></script>
+<script>
+const WELCOME_KEY = 'rakija-judge-welcomed';
+let me = null, name = '', st = null, mine = {}, finale = null, interim = null, err = '', busy = false;
+
+const welcomed = () => localStorage.getItem(WELCOME_KEY) === me;
+const currentRound = () => firstOpenRound(mine, st.n);
+const bigName = () => name.toLocaleUpperCase('hr');
+const myRef = r => FB.db.ref('ratings/' + me + '/' + r);
+
+function render() {
+  const v = document.getElementById('view');
+  const body = finale ? revealView(finale)          // host started the finale: everyone follows the reveal
+    : !st ? el('p', { class: 'mute center' }, 'Učitavanje…')
+    : !st.locked ? viewWaitSetup()
+    : !welcomed() ? viewWelcome()
+    : interim !== null ? viewInterim()
+    : currentRound() === null ? viewStats()
+    : currentRound() > st.open ? viewWait(currentRound())
+    : viewForm(currentRound());
+  v.replaceChildren(err ? el('div', { class: 'warn' }, err) : '', body);
+}
+
+function viewWaitSetup() {
+  return el('div', { class: 'card center' }, el('div', { class: 'spin' }, '🥃'),
+    el('h2', { style: 'justify-content:center' }, 'Još malo…'),
+    el('p', { class: 'mute' }, 'Točitelj još priprema natjecanje. Stranica će se sama otvoriti kad bude spremno.'));
+}
+
+function viewWelcome() {
+  return el('div', { class: 'card center' },
+    el('div', { class: 'bigname' }, bigName()),
+    el('button', { class: 'primary big', onclick: () => { localStorage.setItem(WELCOME_KEY, me); render(); } }, 'DALJE ▶'));
+}
+
+function viewWait(r) {
+  return el('div', { class: 'card center' }, el('div', { class: 'spin' }, '🥃'),
+    el('h2', { style: 'justify-content:center' }, 'Čekaj točitelja…'),
+    el('p', { class: 'mute' }, r === 0 ? 'Kalibracija počinje uskoro.' : 'Sljedeće: ' + roundLabel(r) + '. Stranica će se sama otvoriti.'));
+}
+
+function viewForm(r) {
+  const cell = mine[r] || { c: [null, null, null, null], locked: false };
+  const avg = catAverage(cell.c);
+  const missing = CATEGORIES.filter((_, k) => cell.c[k] === null);
+  const cats = CATEGORIES.map((cname, k) => {
+    const grid = el('div', { class: 'grid' });
+    for (let s = SCORE_MIN; s <= SCORE_MAX; s++) {
+      grid.append(el('button', { class: cell.c[k] === s ? 'sel' : '', onclick: () => setCat(r, k, s) }, String(s)));
+    }
+    return el('div', { class: 'card cat' }, el('div', { class: 'juror', style: 'margin:0' },
+      el('div', { class: 'name cat-name' }, el('span', {}, cname), cell.c[k] ? el('small', {}, String(cell.c[k])) : ''), grid));
+  });
+  return el('div', {},
+    el('div', { class: 'card stickyavg' },
+      el('div', { class: 'lab' }, roundLabel(r) + (r === 0 ? ' · ne ulazi u bodove' : '') + ' · prosjek'),
+      el('div', { class: 'val' }, avg === null ? '-' : avg.toFixed(2))),
+    cats,
+    el('button', { class: 'primary big', disabled: busy || missing.length > 0, onclick: () => lock(r) }, 'Zaključi ocjenu'),
+    el('p', { class: 'mute center' }, missing.length ? 'Ocijeni još: ' + missing.join(', ') : 'Dodir na istu ocjenu je briše.'));
+}
+
+function fail(e) { err = /PERMISSION_DENIED/i.test(e.message || '') ? 'Runda nije otvorena ili je ocjena već zaključena.' : 'Nema veze sa serverom.'; render(); }
+
+function setCat(r, k, s) {
+  const cell = mine[r] || { c: [null, null, null, null], locked: false };
+  const c = cell.c.slice(); c[k] = c[k] === s ? null : s;
+  err = '';
+  myRef(r).set(FB.cellOut(c, false)).catch(fail);   // the local listener fires at once, so the tap shows immediately
+}
+
+async function lock(r) {
+  const c = (mine[r] || { c: [null, null, null, null] }).c;
+  if (c.some(v => v === null)) return;   // button is disabled; the database rules enforce it too
+  busy = true; err = ''; render();
+  try { await myRef(r).set(FB.cellOut(c, true)); interim = r; }
+  catch (e) { fail(e); }
+  busy = false; render();
+}
+
+function viewInterim() {
+  const cell = mine[interim];
+  return el('div', { class: 'card center' },
+    el('h2', { style: 'justify-content:center' }, '✓ Ocjena zaključena'),
+    el('div', { class: 'mute' }, roundLabel(interim)),
+    el('div', { class: 'bigname', style: 'margin:14px 0 24px' }, catAverage(cell.c).toFixed(2)),
+    el('button', { class: 'primary big', onclick: () => { interim = null; render(); } }, 'DALJE ▶'));
+}
+
+function viewStats() {
+  const stt = judgeStats(mine, st.n);
+  const names = list => list.map(x => 'Rakija ' + x.round).join(', ') || '–';
+  const bestCat = stt.catMeans.reduce((b, v, k) => (v !== null && (b === -1 || v > stt.catMeans[b])) ? k : b, -1);
+  return el('div', {},
+    el('div', { class: 'card center' }, el('h2', { style: 'justify-content:center' }, '📊 Tvoja statistika'), el('div', { class: 'mute' }, name)),
+    el('div', { class: 'card' }, el('div', { class: 'sum' },
+      el('div', {}, el('span', { class: 'mute' }, 'Tvoj prosjek'), el('b', {}, stt.mean === null ? '-' : stt.mean.toFixed(2))),
+      el('div', {}, el('span', { class: 'mute' }, 'Najjača kategorija'), el('b', {}, bestCat === -1 ? '-' : CATEGORIES[bestCat])),
+      el('div', {}, el('span', { class: 'mute' }, 'Tvoja favoritkinja'), el('b', { style: 'font-size:18px' }, names(stt.best))),
+      el('div', {}, el('span', { class: 'mute' }, 'Najslabije ocijenjena'), el('b', { style: 'font-size:18px' }, names(stt.worst))))),
+    el('div', { class: 'card' }, el('h2', {}, 'Tvoj poredak'),
+      stt.ranked.map(x => el('div', {},
+        el('div', { class: 'stat' },
+          el('div', { class: 'lbl' }, (x.place === null ? '–' : x.place + '.') + ' Rakija ' + x.round),
+          el('div', { class: 'meter' }, el('i', { style: 'width:' + (x.avg === null ? 0 : x.avg * 10) + '%' })),
+          el('div', { class: 'num' }, x.avg === null ? '-' : x.avg.toFixed(1))),
+        el('div', { class: 'mute', style: 'margin:-4px 0 6px 106px;font-size:12px' },
+          CATEGORIES.map((n, k) => n[0] + ' ' + (x.c[k] === null ? '–' : x.c[k])).join(' · '))))),
+    el('p', { class: 'mute center' }, 'Hvala na ocjenjivanju! Ukupne rezultate objavljuje točitelj. 🥃'));
+}
+
+FB.guard('judge').then(({ user, name: n }) => {
+  me = user.uid; name = n;
+  FB.db.ref('state').on('value', s => { st = FB.stateOf(s.val()); render(); });
+  FB.db.ref('ratings/' + me).on('value', s => { mine = FB.cellMap(s.val()); render(); });
+  FB.db.ref('pub/finale').on('value', s => { finale = FB.finaleOf(s.val()); render(); });
+  render();
+});
+render();
+</script>
+</body>
+</html>

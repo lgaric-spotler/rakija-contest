@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="hr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1a0f08">
+<title>Rakija Contest – točitelj</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🥃%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1><a href="index.html" title="Početna">🥃 Rakija Contest</a></h1>
+    <div class="sub">točitelj</div>
+    <div class="who" id="who"></div>
+  </header>
+  <nav class="tabs hidden" id="tabs">
+    <button data-tab="setup">Postavke</button>
+    <button data-tab="score">Ocjene</button>
+    <button data-tab="finale">Finale</button>
+  </nav>
+  <div id="view"></div>
+  <div class="sync" id="sync"></div>
+</main>
+
+<script src="vendor/firebase-app-compat.js"></script>
+<script src="vendor/firebase-auth-compat.js"></script>
+<script src="vendor/firebase-database-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="logic.js"></script>
+<script src="common.js"></script>
+<script src="fb.js"></script>
+<script>
+// Everything lives in Firebase and is pushed to this page live. `ui` (tab, round) stays on this device.
+//   users          who has registered (name + PIN)               state    {locked, n, open, openRounds}   (everybody reads)
+//   judges         who the host ticked as judge                  admin    {owners, manual, finale}       (host only)
+//   ratings        {uid: {round: {c, locked}}}                   pub      what viewers/judges may see (published by THIS page)
+const UI_KEY = 'rakija-contest-ui-fb1';
+const DEFAULT_UI = { tab: 'setup', round: 0 };
+const clone = o => JSON.parse(JSON.stringify(o));
+let ui = (() => { try { return Object.assign(clone(DEFAULT_UI), JSON.parse(localStorage.getItem(UI_KEY))); } catch (e) { return clone(DEFAULT_UI); } })();
+const S = { users: {}, judges: {}, st: { locked: false, n: 8, open: -1 }, adm: { owners: {}, manual: {}, finale: null }, ratings: {} };
+let loaded = false, syncOk = null, got = {};
+const pendingOwners = {}, ownerTimers = {};
+const db = () => FB.db;
+
+// ---- the database state in the shape logic.js understands (judges = jurors, ordered by name) ----
+function judgeUids() {
+  return Object.keys(S.judges).filter(u => S.users[u]).sort((a, b) => S.users[a].name.localeCompare(S.users[b].name, 'hr') || a.localeCompare(b));
+}
+function logicState() {
+  const uids = judgeUids(), scores = {}, cats = {};
+  uids.forEach((u, i) => {
+    Object.keys(S.adm.manual || {}).forEach(r => { const v = S.adm.manual[r][u]; if (typeof v === 'number') (scores[r] = scores[r] || {})[i] = v; });
+    const mine = FB.cellMap(S.ratings[u]);
+    Object.keys(mine).forEach(r => { (cats[r] = cats[r] || {})[i] = mine[r]; });
+  });
+  return { jurors: uids.map(u => S.users[u].name), uids, n: S.st.n, owners: S.adm.owners || {}, scores, cats, locked: S.st.locked, open: S.st.open, finale: S.adm.finale || null };
+}
+
+// ---- writes ----
+const track = p => p.then(() => { syncOk = true; paintSync(); }, e => { syncOk = false; paintSync(); console.error(e); });
+function setState(patch) { Object.assign(S.st, patch); return track(db().ref('state').update(patch)); }
+function setOpen(r) {                         // open round r (or go back); openRounds is what the rules check for judges
+  const upd = { open: r };
+  if (r > S.st.open) for (let i = S.st.open + 1; i <= r; i++) upd['openRounds/' + i] = true;
+  else for (let i = r + 1; i <= S.st.open; i++) upd['openRounds/' + i] = null;
+  S.st.open = r; render(); return track(db().ref('state').update(upd));
+}
+function setFinale(step) {                    // step null = close; publishes exactly the revealed part
+  S.adm.finale = step === null ? null : { step };
+  const v = step === null ? null : finaleView(logicState());
+  lastPub.finale = v ? JSON.stringify(pubFinale(v)) : undefined;
+  render();
+  return track(Promise.all([db().ref('admin/finale').set(S.adm.finale), db().ref('pub/finale').set(v ? pubFinale(v) : null)]));
+}
+const pubFinale = v => ({ step: v.step, total: v.total, done: v.done, tied: v.tied,
+  items: v.items.map(x => ({ round: x.round, place: x.place, avg: x.avg, owner: x.owner })) });
+
+// ---- publish what judges/viewers are allowed to see (locked ratings of a round only when all judges have one) ----
+let lastPub = {};
+function publish() {
+  if (!loaded) return;
+  const L = logicState(), want = {};
+  for (let r = 0; r <= Math.min(L.open, L.n); r++) {
+    const ratings = L.jurors.map((jn, i) => { const cell = (L.cats[r] || {})[i]; return { name: jn, c: cell && cell.locked ? cell.c.map(v => v === null ? '' : v).join(',') : '', avg: scoreOf(L, r, i) }; });
+    const done = ratings.filter(x => x.avg !== null).length;
+    want['rounds/' + r] = { done, total: L.jurors.length, ratings: done === L.jurors.length && done > 0 ? ratings : null };
+  }
+  Object.keys(lastPub).forEach(k => { if (!(k in want)) want[k] = null; });
+  const upd = {};
+  Object.keys(want).forEach(k => { if (JSON.stringify(want[k]) !== JSON.stringify(lastPub[k] ?? null)) upd[k] = want[k]; });
+  if (L.finale) { const f = JSON.stringify(pubFinale(finaleView(L))); if (f !== lastPub.finale) { upd.finale = JSON.parse(f); } }
+  if (!Object.keys(upd).length) return;
+  Object.keys(upd).forEach(k => { lastPub[k] = k === 'finale' ? JSON.stringify(upd[k]) : upd[k]; });
+  track(db().ref('pub').update(upd));
+}
+
+function paintSync() {
+  const e = document.getElementById('sync'); if (!e) return;
+  e.replaceChildren(syncOk === null ? '' : syncOk ? el('b', {}, '● spremljeno (uživo)') : el('b', { class: 'off' }, '○ nema veze'));
+}
+
+// ---- views ----
+function render() {
+  localStorage.setItem(UI_KEY, JSON.stringify(ui));
+  const tabs = document.getElementById('tabs');
+  tabs.classList.toggle('hidden', !loaded);
+  tabs.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.tab === ui.tab));
+  document.getElementById('view').replaceChildren(!loaded ? el('p', { class: 'mute center' }, 'Učitavanje…') :
+    ui.tab === 'setup' ? viewSetup() : ui.tab === 'score' ? viewScore() : viewFinale());
+  paintSync();
+}
+function renderUnlessTyping() { const a = document.activeElement; if (!(a && /INPUT|TEXTAREA/.test(a.tagName))) render(); }
+
+function viewSetup() {
+  const Lk = S.st.locked;
+  const users = Object.keys(S.users).sort((a, b) => S.users[a].name.localeCompare(S.users[b].name, 'hr'));
+  const nInput = el('input', { type: 'number', min: 1, max: 20, inputmode: 'numeric', value: S.st.n, disabled: Lk });
+  nInput.addEventListener('change', () => { setState({ n: Math.max(1, Math.min(20, parseInt(nInput.value, 10) || 8)) }); render(); });
+  const owners = el('div');
+  for (let r = 1; r <= S.st.n; r++) {
+    const inp = el('input', { placeholder: 'Čija je rakija ' + r + '?', value: (S.adm.owners || {})[r] || '', disabled: Lk });
+    inp.addEventListener('input', () => {                    // saved shortly after typing stops; own typing is never overwritten by an echo
+      S.adm.owners = S.adm.owners || {}; S.adm.owners[r] = inp.value; pendingOwners[r] = inp.value;
+      clearTimeout(ownerTimers[r]);
+      ownerTimers[r] = setTimeout(() => { const v = inp.value; track(db().ref('admin/owners/' + r).set(v).then(() => { if (pendingOwners[r] === v) delete pendingOwners[r]; })); }, 300);
+    });
+    owners.append(el('label', {}, 'Rakija ' + r), inp);
+  }
+  const usersCard = el('div', { class: 'card' },
+    el('h2', {}, '👥 Prijavljeni ljudi', Lk ? el('span', { class: 'pill ok' }, '🔒 zaključano') : ''),
+    el('p', { class: 'mute' }, Lk ? 'Sudci su odabrani. Ostali gledaju.' : 'Ljudi se sami prijave imenom na početnoj stranici. Označi tko su sudci, ostali su gledatelji.'),
+    users.length ? '' : el('p', { class: 'mute center' }, 'Još nitko nije prijavljen.'),
+    users.map(u => {
+      const isJ = !!S.judges[u];
+      return el('div', { class: 'juror' }, el('div', { class: 'name' },
+        el('span', {}, S.users[u].name, el('small', { class: 'mute', style: 'margin-left:8px' }, 'PIN ' + S.users[u].pin)),
+        Lk ? el('span', { class: 'pill' + (isJ ? ' ok' : '') }, isJ ? 'sudac' : 'gledatelj')
+           : el('button', { class: 'small' + (isJ ? ' primary' : ''), onclick: () => {
+               if (isJ) delete S.judges[u]; else S.judges[u] = true;
+               render(); track(db().ref('judges/' + u).set(isJ ? null : true)); } }, isJ ? '✓ sudac' : 'sudac?')));
+    }),
+    Lk ? el('div', { style: 'margin-top:14px' }, el('button', { class: 'big', onclick: () => {
+        if (!confirm('Otključati postavke? Sudci neće moći ocjenjivati dok ih ponovno ne zaključaš.')) return;
+        setState({ locked: false }); render();
+      } }, '🔓 Otključaj postavke'))
+      : el('div', { style: 'margin-top:14px' }, el('button', { class: 'primary big', onclick: () => {
+          const missing = []; for (let r = 1; r <= S.st.n; r++) if (!((S.adm.owners || {})[r] || '').trim()) missing.push(r);
+          if (!judgeUids().length) return alert('Označi barem jednog suca.');
+          if (missing.length) return alert('Ključ nije potpun. Upiši vlasnika za rakije: ' + missing.join(', '));
+          if (!confirm('Zaključati postavke? Označeni ljudi postaju sudci i mogu ocjenjivati.')) return;
+          setState({ locked: true }); render();
+        } }, 'Zaključi postavke')));
+  const setupCard = el('div', { class: 'card' }, el('h2', {}, '🥃 Rakije'),
+    el('label', {}, 'Broj rakija (bez kalibracije)'), nInput);
+  const keyCard = el('div', { class: 'card' },
+    el('h2', {}, '🔑 Ključ'),
+    el('p', { class: 'mute' }, 'Samo za točitelja: čija je koja rakija (prikazuje se u finalu). Svi ocjenjuju sve rakije, uključujući vlastitu.'),
+    owners);
+  return el('div', {}, usersCard, setupCard, keyCard,
+    el('div', { class: 'card' }, el('button', { class: 'danger', onclick: async () => {
+      if (!confirm('Obrisati sve ocjene, sudce i postavke? (prijavljeni ljudi ostaju)')) return;
+      lastPub = {};
+      await track(db().ref().update({ judges: null, state: null, admin: null, ratings: null, pub: null }));
+      S.judges = {}; S.ratings = {}; S.adm = { owners: {}, manual: {}, finale: null }; S.st = { locked: false, n: 8, open: -1 };
+      await track(db().ref('state').set({ locked: false, n: 8, open: -1 }));
+      ui = clone(DEFAULT_UI); render();
+    } }, 'Reset svega')));
+}
+
+function judgeStatus(L, r, i) {
+  const cell = ((L.cats[r] || {})[i]);
+  if (cell && cell.locked) return ['✓ zaključio', 'ok'];
+  if (cell && cell.c.some(v => v !== null)) return ['… ocjenjuje', ''];
+  return ['čeka', ''];
+}
+
+function viewScore() {
+  const L = logicState(), r = Math.min(ui.round, L.n);
+  const miss = missingScores(L), open = L.open, uids = L.uids;
+
+  const roundCard = el('div', { class: 'card' },
+    el('h2', {}, '🎬 Runda za sudce'),
+    !L.locked ? el('div', { class: 'warn' }, 'Prvo zaključi postavke (tab Postavke).') : '',
+    el('p', {}, open < 0 ? 'Još nije otvorena nijedna rakija.' : ['Sudci sada ocjenjuju: ', el('b', {}, roundLabel(open))]),
+    open >= 0 ? L.jurors.map((j, i) => { const [t, c] = judgeStatus(L, open, i);
+      return el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j), el('span', { class: 'pill ' + c }, t))); }) : '',
+    el('div', { class: 'row full', style: 'margin-top:14px' },
+      open >= 0 ? el('button', { class: 'small', onclick: () => {
+        const anyLocked = L.jurors.some((_, i) => (L.cats[open] || {})[i] && L.cats[open][i].locked);
+        if (anyLocked && !confirm('Neki sudci su već zaključili ovu rakiju. Svejedno vratiti?')) return;
+        setOpen(open - 1); } }, '◀ Vrati') : '',
+      el('button', { class: 'primary', disabled: !L.locked || open >= L.n, onclick: () => { ui.round = open + 1; setOpen(open + 1); } },
+        open >= L.n ? 'Sve rakije otvorene' : 'Otvori ' + roundLabel(open + 1) + ' ▶')));
+
+  const chips = el('div', { class: 'chips' });
+  for (let i = 0; i <= L.n; i++) {
+    const done = !miss.some(m => m.round === i);
+    chips.append(el('button', { class: (done ? 'done ' : '') + (i === r ? 'cur' : ''), onclick: () => { ui.round = i; render(); } }, i === 0 ? 'K' : String(i)));
+  }
+  const entered = L.jurors.filter((_, i) => scoreOf(L, r, i) !== null).length;
+  const jur = L.jurors.map((j, i) => {
+    const cell = (L.cats[r] || {})[i];
+    const cur = (L.scores[r] || {})[i];
+    if (cell && cell.locked) {
+      return el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j),
+        el('span', { class: 'row' }, el('small', {}, '📱 ' + catAverage(cell.c).toFixed(2)),
+          el('button', { class: 'small', onclick: () => {
+            if (!confirm('Otključati ocjenu za ' + j + '? Sudac je može ponovno urediti.')) return;
+            track(db().ref('ratings/' + uids[i] + '/' + r + '/locked').set(false)); } }, 'Otključaj'))));
+    }
+    const grid = el('div', { class: 'grid' });
+    for (let s = SCORE_MIN; s <= SCORE_MAX; s++) {
+      grid.append(el('button', { class: cur === s ? 'sel' : '', onclick: () => {
+        const path = 'admin/manual/' + r + '/' + uids[i];
+        S.adm.manual = S.adm.manual || {}; S.adm.manual[r] = S.adm.manual[r] || {};
+        if (S.adm.manual[r][uids[i]] === s) { delete S.adm.manual[r][uids[i]]; track(db().ref(path).set(null)); }
+        else { S.adm.manual[r][uids[i]] = s; track(db().ref(path).set(s)); }
+        render(); publish();
+      } }, String(s)));
+    }
+    return el('div', { class: 'juror' }, el('div', { class: 'name' }, el('span', {}, j), cur ? el('small', {}, String(cur)) : ''), grid);
+  });
+  return el('div', {}, roundCard,
+    el('div', { class: 'card' }, el('h2', {}, '✍️ Ručni unos / pregled'), chips),
+    el('div', { class: 'card' },
+      el('h2', {}, roundLabel(r), r === 0 ? el('span', { class: 'pill' }, 'ne ulazi u bodove') : ''),
+      el('div', { class: 'bar' }, el('i', { style: 'width:' + (L.jurors.length ? 100 * entered / L.jurors.length : 0) + '%' })),
+      el('div', { class: 'mute' }, 'Ocjena ima ' + entered + ' / ' + L.jurors.length + ' · mobitel zaključuje ocjenu sam, ručni unos je rezerva · poredak je skriven do finala'),
+      jur,
+      el('div', { class: 'row full', style: 'margin-top:18px' },
+        r > 0 ? el('button', { onclick: () => { ui.round = r - 1; render(); } }, '◀ Prethodna') : '',
+        r < L.n ? el('button', { class: 'primary', onclick: () => { ui.round = r + 1; render(); } }, 'Sljedeća ▶')
+                : el('button', { class: 'primary', onclick: () => { ui.tab = 'finale'; render(); } }, 'Finale 🏆'))));
+}
+
+function viewFinale() {
+  const L = logicState(), miss = missingScores(L);
+  if (!L.finale) {
+    return el('div', { class: 'card center' },
+      el('h2', { style: 'justify-content:center' }, '🏆 Finale'),
+      el('p', { class: 'mute' }, 'Ocjene i poredak ostaju skriveni dok ne pokreneš finale. Kad ga pokreneš, i sudci i gledatelji vide otkrivanje na svojim ekranima.'),
+      miss.length ? el('div', { class: 'warn' }, 'Nedostaje ' + miss.length + ' ocjena: ' +
+        miss.slice(0, 8).map(m => roundLabel(m.round) + ' / ' + m.juror).join(', ') + (miss.length > 8 ? ' …' : '')) : '',
+      el('button', { class: 'primary big', onclick: () => {
+        if (miss.length && !confirm('Nedostaju ocjene. Svejedno pokrenuti finale?')) return;
+        setFinale(0);
+      } }, 'Pokreni finale'));
+  }
+  const f = finaleView(L);             // exactly what judges and viewers see
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('div', { class: 'row full' },
+        f.done ? el('span', { class: 'center', style: 'font-weight:700' }, 'Gotovo 🎉')
+               : el('button', { class: 'primary', style: 'font-size:18px;padding:16px', onclick: () => setFinale(f.step + 1) },
+                   f.step % 2 === 0 ? 'Otkrij rezultat ▶' : 'Otkrij vlasnika ▶')),
+      el('div', { class: 'row full', style: 'margin-top:8px' },
+        el('button', { onclick: () => setFinale(f.total) }, 'Prikaži sve'),
+        el('button', { onclick: () => { if (!confirm('Zatvoriti finale? Sudci i gledatelji se vraćaju na normalni prikaz.')) return; setFinale(null); } }, 'Natrag')),
+      f.done && f.tied ? el('div', { class: 'warn' }, 'Izjednačeno za 1. mjesto → blind dvoboj.') : ''),
+    f.items.length ? '' : el('p', { class: 'mute center' }, 'Počinje od zadnjeg mjesta…'),
+    rankCards(f));
+}
+
+document.getElementById('tabs').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  ui.tab = b.dataset.tab; render();
+});
+
+// ---- go live ----
+FB.guard('admin').then(() => {
+  const need = ['users', 'judges', 'state', 'admin', 'ratings'];
+  const listen = (key, fn) => db().ref(key).on('value', s => {
+    fn(s.val()); got[key] = true;
+    if (!loaded && need.every(k => got[k])) {
+      loaded = true;
+      if (!S.stateExists) db().ref('state').once('value').then(x => { if (!x.exists()) setState({ locked: false, n: 8, open: -1 }); });
+    }
+    if (loaded) { renderUnlessTyping(); publish(); }
+  }, () => { syncOk = false; paintSync(); });
+  listen('users', v => { S.users = v || {}; });
+  listen('judges', v => { S.judges = v || {}; });
+  listen('state', v => { S.stateExists = !!v; S.st = Object.assign({ locked: false, n: 8, open: -1 }, FB.stateOf(v || { n: 8 })); if (!v) S.st.n = 8; });
+  listen('admin', v => { v = v || {};
+    const owners = Object.assign({}, v.owners || {}, pendingOwners);           // RTDB may return an array; typed-but-unsaved text wins
+    S.adm = { owners, manual: v.manual || {}, finale: v.finale ? { step: v.finale.step } : null }; });
+  listen('ratings', v => { S.ratings = v || {}; });
+  db().ref('.info/connected').on('value', s => { syncOk = !!s.val(); paintSync(); });
+});
+render();
+</script>
+</body>
+</html>
